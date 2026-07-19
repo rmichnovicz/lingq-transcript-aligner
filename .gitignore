@@ -1,0 +1,31 @@
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Secrets / local env
+.env
+.env.*
+
+# macOS
+.DS_Store
+
+# ---- Do not commit copyrighted podcast content or derived artifacts ----
+# Source media + transcripts (bring your own; not distributed with this tool)
+*.mp3
+*.m4a
+*.wav
+*.txt
+*.srt
+
+# Whisper transcription cache
+*.whisper.json
+
+# Generated LingQ lesson parts
+lingq_import/
+
+# ---- Allowlist the project's own text files (override the *.txt rule) ----
+!README.md
+!requirements.txt
+!LICENSE
+!.gitignore
