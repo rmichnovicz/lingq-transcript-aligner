@@ -146,11 +146,18 @@ _SPEAKER_RE = re.compile(r"^\s*\[[^\]]*\]\s*:?")
 _PAREN_RE = re.compile(r"\([^)]*\)")
 
 
-def parse_transcript(path: str) -> tuple[list[Tok], list[str]]:
+def parse_transcript(
+    path: str,
+) -> tuple[list[Tok], list[str], dict[int, str], dict[int, list[int]]]:
     """Parse into a flat token list plus the list of raw paragraph strings.
 
     Alignable tokens get a non-empty `.norm`; speaker labels and parenthetical
     stage directions are kept for display but marked unalignable (norm="").
+
+    Also returns `sent_text` (sentence id -> verbatim sentence text, as split
+    by `split_sentences`) and `para_sents` (paragraph index -> ordered list of
+    its sentence ids) so callers can fall back to sentence-granularity cuts
+    for paragraphs that have no internal blank-line breaks to split on.
     """
     with open(path, encoding="utf-8") as f:
         raw = f.read()
@@ -158,6 +165,8 @@ def parse_transcript(path: str) -> tuple[list[Tok], list[str]]:
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", raw) if p.strip()]
     toks: list[Tok] = []
     sent_counter = 0
+    sent_text: dict[int, str] = {}
+    para_sents: dict[int, list[int]] = {}
 
     for pi, para in enumerate(paragraphs):
         # Pull off a leading speaker label so its bracketed name isn't aligned.
@@ -177,6 +186,8 @@ def parse_transcript(path: str) -> tuple[list[Tok], list[str]]:
         first_word_in_para = True
         for sent in sentences:
             sent_counter += 1
+            sent_text[sent_counter] = sent
+            para_sents.setdefault(pi, []).append(sent_counter)
             # Walk the sentence, separating parenthetical stage directions.
             pos = 0
             for pm in _PAREN_RE.finditer(sent):
@@ -193,7 +204,7 @@ def parse_transcript(path: str) -> tuple[list[Tok], list[str]]:
             if len(toks) > n_before:
                 first_word_in_para = False
 
-    return toks, paragraphs
+    return toks, paragraphs, sent_text, para_sents
 
 
 def _emit_words(text: str, pi: int, si: int, toks: list[Tok], prefix: str) -> None:
@@ -535,11 +546,14 @@ def clean_transcript(paragraphs: list[str], toks: list[Tok],
 # --------------------------------------------------------------------------- #
 def build_chunks(paragraphs: list[str], toks: list[Tok],
                  regions: list[tuple[float, float]], clean_dur: float,
-                 word_limit: int) -> list[dict]:
+                 word_limit: int, sent_text: dict[int, str],
+                 para_sents: dict[int, list[int]]) -> list[dict]:
     """Split kept paragraphs into LingQ lessons. Primary break points are the
     interior ad breaks (natural episode pauses); any section still over
-    word_limit is then balance-split by word count. Each chunk carries its audio
-    [a, b] span on the trimmed timeline."""
+    word_limit is then balance-split by word count, falling back to
+    sentence-boundary cuts for paragraphs that have no blank-line breaks of
+    their own to split on. Each chunk carries its audio [a, b] span on the
+    trimmed timeline."""
     import bisect
     import math
     from statistics import median
@@ -553,15 +567,15 @@ def build_chunks(paragraphs: list[str], toks: list[Tok],
             if r is not None:
                 pmin.setdefault(t.para, []).append(r)
 
-    kept: list[tuple[str, Optional[float]]] = []
+    kept: list[tuple[int, str, Optional[float]]] = []
     for pi, para in enumerate(paragraphs):
         ts = torig.get(pi)
         if not ts:
-            kept.append((para, None))       # stage direction — travels along
+            kept.append((pi, para, None))   # stage direction — travels along
             continue
         if remap_time(median(ts), regions) is not None:
             st = min(pmin[pi]) if pmin.get(pi) else None
-            kept.append((para, st))
+            kept.append((pi, para, st))
 
     # Interior ad breaks -> split points on the trimmed timeline. An ad's start
     # maps to the seam where it was removed; keep only breaks with content on
@@ -576,30 +590,67 @@ def build_chunks(paragraphs: list[str], toks: list[Tok],
 
     # Assign paragraphs to ad-delimited sections (stage directions inherit the
     # current section).
-    sections: list[list[tuple[str, Optional[float]]]] = \
+    sections: list[list[tuple[int, str, Optional[float]]]] = \
         [[] for _ in range(len(split_pts) + 1)]
     cur_sec = 0
-    for para, st in kept:
+    for pi, para, st in kept:
         if st is not None:
             cur_sec = bisect.bisect_right(split_pts, st)
-        sections[cur_sec].append((para, st))
+        sections[cur_sec].append((pi, para, st))
+
+    def expand_oversized(
+        pi: int, para: str, st: Optional[float]
+    ) -> list[tuple[int, str, Optional[float]]]:
+        """A paragraph with no internal blank-line breaks has no cut point of
+        its own. If it alone exceeds word_limit, fall back to splitting it at
+        sentence boundaries (each piece keeps a real timestamp) so the
+        balance-split below has somewhere to cut."""
+        if len(para.split()) <= word_limit:
+            return [(pi, para, st)]
+        sids = para_sents.get(pi, [])
+        if len(sids) <= 1:
+            return [(pi, para, st)]
+        label = ""
+        m = _SPEAKER_RE.match(para)
+        if m:
+            label = m.group(0).strip()
+        sent_start: dict[int, float] = {}
+        for t in toks:
+            if t.para == pi and t.norm and t.start is not None:
+                r = remap_time(t.start, regions)
+                if r is not None:
+                    sent_start.setdefault(t.sent, r)
+        units = []
+        for i, sid in enumerate(sids):
+            text = sent_text.get(sid, "").strip()
+            if not text:
+                continue
+            if i == 0 and label:
+                text = f"{label} {text}"
+            units.append((pi, text, sent_start.get(sid)))
+        return units if units else [(pi, para, st)]
 
     # Sub-split any section that still exceeds the word limit (balanced).
-    chunks: list[list[tuple[str, Optional[float]]]] = []
+    chunks: list[list[tuple[int, str, Optional[float]]]] = []
     for sec in sections:
         if not sec:
             continue
-        words = sum(len(p.split()) for p, _ in sec)
+        expanded: list[tuple[int, str, Optional[float]]] = []
+        for pi, para, st in sec:
+            expanded.extend(expand_oversized(pi, para, st))
+        sec = expanded
+
+        words = sum(len(p.split()) for _, p, _ in sec)
         if words <= word_limit:
             chunks.append(sec)
             continue
         n = math.ceil(words / word_limit)
         target = words / n
-        cur: list[tuple[str, Optional[float]]] = []
+        cur: list[tuple[int, str, Optional[float]]] = []
         acc = 0
         cuts = 0
-        for para, st in sec:
-            cur.append((para, st))
+        for pi, para, st in sec:
+            cur.append((pi, para, st))
             acc += len(para.split())
             if cuts < n - 1 and acc >= target * (cuts + 1):
                 chunks.append(cur)
@@ -609,10 +660,26 @@ def build_chunks(paragraphs: list[str], toks: list[Tok],
             chunks.append(cur)
 
     def cstart(ch) -> Optional[float]:
-        for _, st in ch:
+        for _, _, st in ch:
             if st is not None:
                 return st
         return None
+
+    def join_text(ch: list[tuple[int, str, Optional[float]]]) -> str:
+        # Blank line between distinct source paragraphs (matches the
+        # original verbatim join); plain space between sentence-level
+        # pieces of the same paragraph produced by expand_oversized above.
+        pieces = []
+        prev_pi = None
+        for pi, text, _ in ch:
+            if not pieces:
+                pieces.append(text)
+            elif pi != prev_pi:
+                pieces.append("\n\n" + text)
+            else:
+                pieces.append(" " + text)
+            prev_pi = pi
+        return "".join(pieces)
 
     out = []
     for i, ch in enumerate(chunks):
@@ -622,9 +689,9 @@ def build_chunks(paragraphs: list[str], toks: list[Tok],
         else:
             b = clean_dur
         out.append({
-            "text": "\n\n".join(p for p, _ in ch),
+            "text": join_text(ch),
             "a": a, "b": b,
-            "words": sum(len(p.split()) for p, _ in ch),
+            "words": sum(len(p.split()) for _, p, _ in ch),
         })
     return out
 
@@ -690,7 +757,7 @@ def main(argv=None):
     w_norms, w_meta = whisper_word_tokens(wh["words"])
     duration = wh.get("duration") or (w_meta[-1]["end"] if w_meta else 0.0)
 
-    toks, paragraphs = parse_transcript(args.transcript)
+    toks, paragraphs, sent_text, para_sents = parse_transcript(args.transcript)
     stats = align(toks, w_norms, w_meta)
     print(f"[align] transcript alignable words: {stats['alignable']}, "
           f"matched: {stats['matched']} ({stats['match_rate']*100:.1f}%)",
@@ -745,44 +812,47 @@ def main(argv=None):
         print(f"[trim] {len(ccues)} cues on trimmed timeline -> {clean_srt}",
               file=sys.stderr)
 
-        # Split into LingQ-sized lessons (text + matching audio) so LingQ won't
-        # auto-split (which would pair every part with the full audio).
+        # Build the LingQ-ready lesson(s) (text + matching audio) and always
+        # place them in lingq_import/ — whether the episode needed splitting
+        # or not — so there's a single place to look for what to import.
         if args.split_words > 0:
             trimmed_dur = kept_segments(regions, duration)
             trimmed_dur = sum(b - a for a, b in trimmed_dur)
             chunks = build_chunks(paragraphs, toks, regions, trimmed_dur,
-                                  args.split_words)
-            if len(chunks) > 1:
-                stem = os.path.splitext(os.path.basename(args.transcript))[0]
-                outdir = os.path.join(os.path.dirname(args.transcript) or ".",
-                                      "lingq_import")
-                os.makedirs(outdir, exist_ok=True)
-                n = len(chunks)
+                                  args.split_words, sent_text, para_sents)
+            stem = os.path.splitext(os.path.basename(args.transcript))[0]
+            outdir = os.path.join(os.path.dirname(args.transcript) or ".",
+                                  "lingq_import")
+            os.makedirs(outdir, exist_ok=True)
+            n = len(chunks)
+            if n > 1:
                 print(f"[split] {sum(c['words'] for c in chunks)} words -> "
                       f"{n} lessons in {outdir}/", file=sys.stderr)
-                for i, ch in enumerate(chunks, 1):
-                    base = os.path.join(outdir, f"{stem} (Part {i} of {n})")
-                    with open(base + ".txt", "w", encoding="utf-8") as f:
-                        f.write(ch["text"] + "\n")
-                    cut_audio_segment(clean_audio, base + ".mp3", ch["a"], ch["b"])
-                    # per-part SRT on the part's local timeline (verification aid)
-                    part_toks = []
-                    for t in ctoks:
-                        if ch["a"] <= (t.start or -1) < ch["b"] + 0.5:
-                            part_toks.append(Tok(
-                                text=t.text, norm=t.norm, para=t.para,
-                                sent=t.sent, start=t.start - ch["a"],
-                                end=max(0.0, t.end - ch["a"])))
-                    pcues = build_cues(part_toks, args.max_chars, args.max_dur,
-                                       args.min_dur, args.hard_max_dur)
-                    write_srt(pcues, base + ".srt")
+            else:
+                print(f"[split] {chunks[0]['words']} words <= "
+                      f"{args.split_words}; one lesson -> {outdir}/",
+                      file=sys.stderr)
+            for i, ch in enumerate(chunks, 1):
+                name = f"{stem} (Part {i} of {n})" if n > 1 else stem
+                base = os.path.join(outdir, name)
+                with open(base + ".txt", "w", encoding="utf-8") as f:
+                    f.write(ch["text"] + "\n")
+                cut_audio_segment(clean_audio, base + ".mp3", ch["a"], ch["b"])
+                # per-part SRT on the part's local timeline (verification aid)
+                part_toks = []
+                for t in ctoks:
+                    if ch["a"] <= (t.start or -1) < ch["b"] + 0.5:
+                        part_toks.append(Tok(
+                            text=t.text, norm=t.norm, para=t.para,
+                            sent=t.sent, start=t.start - ch["a"],
+                            end=max(0.0, t.end - ch["a"])))
+                pcues = build_cues(part_toks, args.max_chars, args.max_dur,
+                                   args.min_dur, args.hard_max_dur)
+                write_srt(pcues, base + ".srt")
+                if n > 1:
                     print(f"        Part {i}/{n}: {ch['words']} words, "
                           f"{fmt_ts(ch['a'])}-{fmt_ts(ch['b'])} "
                           f"({ch['b'] - ch['a']:.0f}s)", file=sys.stderr)
-            else:
-                print(f"[split] {chunks[0]['words']} words <= "
-                      f"{args.split_words}; no split needed (one lesson)",
-                      file=sys.stderr)
 
 
 if __name__ == "__main__":

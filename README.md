@@ -35,18 +35,21 @@ This writes:
   matches `clean.mp3`)
 - `Episode.clean.srt` — subtitles aligned to `clean.mp3` (bonus, for other players)
 
-- `lingq_import/Episode (Part N of M).txt` / `.mp3` / `.srt` — the lesson split
-  into LingQ-sized parts (see below)
+- `lingq_import/` — the ready-to-import lesson(s), always here regardless of
+  length:
+  - Under the word limit: `lingq_import/Episode.txt` / `.mp3` / `.srt`
+  - Over the word limit: `lingq_import/Episode (Part N of M).txt` / `.mp3` /
+    `.srt`, split into LingQ-sized parts (see below)
 
-Then in LingQ, **for each part**:
+Then in LingQ, **for each lesson in `lingq_import/`**:
 
-1. **Import** → paste `... (Part N of M).txt` (or upload it) as the lesson text.
-2. Attach the matching `... (Part N of M).mp3` as the lesson audio.
+1. **Import** → paste the `.txt` (or upload it) as the lesson text.
+2. Attach the matching `.mp3` as the lesson audio.
 3. Wait for the audio to finish uploading, then click **Generate Timestamps**.
 4. Open **Sentence Mode** — audio and text line up.
 
-Because the ads are gone and each part's audio matches its text, LingQ's matcher
-has an easy, exact job.
+Because the ads are gone and each lesson's audio matches its text, LingQ's
+matcher has an easy, exact job.
 
 ### Why it's pre-split (and split where it is)
 
@@ -54,12 +57,16 @@ LingQ auto-splits any imported lesson over **6,000 words** into 6,000-word parts
 **but it attaches the full audio to every part**, so part 2's text ends up paired
 with audio starting at 0:00 and *Generate Timestamps* misaligns. To avoid that,
 this tool splits the text **and** the audio itself into matching parts, each under
-the limit.
+the limit, and always stages the result in `lingq_import/` — even a
+single-lesson episode gets a copy there, so that folder is always the one place
+to look for what's ready to import.
 
 Split points are the **interior ad breaks** — the natural episode pauses ("Una
 pausa y volvemos"). If a resulting section is still over the word limit, it's
-balance-split by word count at paragraph boundaries. Tune with `--split-words`
-(default 5800; `0` disables). Parts land in `lingq_import/`.
+balance-split by word count at paragraph boundaries, falling back to sentence
+boundaries for transcripts with no blank-line paragraph breaks of their own.
+Tune with `--split-words` (default 5800; `0` disables all of this, including
+staging in `lingq_import/`).
 
 ## How it works
 
